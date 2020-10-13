@@ -1,0 +1,162 @@
+-- decoding AIS
+
+CREATE OR REPLACE FUNCTION public.ais_transform(message text,pad int4)
+      RETURNS json
+      LANGUAGE plcontainer
+      VOLATILE
+AS $$
+      
+      
+# container: plc_python3_ais
+import warnings
+warnings.filterwarnings("ignore")
+import json
+import ais.stream
+
+# decode a file or somthing form the STDIN
+try:
+
+  msg=ais.decode(message,pad)
+except Exception as exc:
+  msg='{"error_text:"' +str(exc)+'}'
+return json.dumps(msg)
+
+
+
+$$
+EXECUTE ON ANY;
+
+
+-- Create_static_dynamic
+
+
+--- USE CASE 1
+
+select (decoded_field->>'mmsi')::int as mmsi,
+round((decoded_field->>'x')::numeric,4) as x,
+round((decoded_field->>'y')::numeric,4) as y,
+(decoded_field->>'position_accuracy')::int as position_accuracy,
+round((decoded_field->>'sog')::numeric,4) as sog,
+round((decoded_field->>'cog')::numeric,4) as cog,
+(decoded_field->>'nav_status')::int as nav_status,
+timestamp_ts as timestamp
+from ais_target
+where decoded_field->'id' in ('1')
+and ((decoded_field->>'x')::float between -2.0 and 9.0 and (decoded_field->>'y')::float between 50.0 and 55.0)
+and (decoded_field->>'sog')::float >= 0.2 and length((decoded_field->>'mmsi')::text)=9) t;
+
+
+--Use Case 2
+
+select (decoded_field->>'mmsi')::int as mmsi,
+(decoded_field->>'imo_num')::int as imo_num,
+null::text as eu_id,
+rtrim((decoded_field->>'name')::text,' @') as name,
+((decoded_field->>'dim_a')::float + (decoded_field->>'dim_b')::float)*10 as length,
+((decoded_field->>'dim_c')::float + (decoded_field->>'dim_d')::float)*10 as beam,
+round(((decoded_field->>'draught')::numeric)*10,1) as draught,
+(decoded_field->>'type_and_cargo')::int as ship_type,
+rtrim((decoded_field->>'destination')::text,' @') as destination,
+null::int as loaded,
+null::int as haz_cargo,
+timestamp_ts as timestamp
+from ais_target
+where (decoded_field->>'id')::int=5 and length((decoded_field->>'mmsi')::text)=9 and load_year =2017 and load_month=1 and load_week=3
+UNION ALL
+select (decoded_field->>'mmsi')::int as mmsi,
+null::int as imo_num,
+(decoded_field->>'eu_id')::text as eu_id,
+null::text as name,
+round(((decoded_field->>'length')::numeric)*10,0) as length,
+round(((decoded_field->>'beam')::numeric)*10,0) as beam,
+round((decoded_field->>'draught')::numeric,1) as draught,
+(decoded_field->>'ship_type')::int as ship_type,
+null::text as destination,
+(decoded_field->>'loaded')::int as loaded,
+(decoded_field->>'haz_cargo')::int as haz_cargo,
+timestamp_ts as timestamp
+from ais_target
+where (decoded_field->>'id')::int=8 and length((decoded_field->>'mmsi')::text)=9 ) t;
+
+
+--Step 1 create a view that will deduplicate static_jan and combine them on  imo_num IS NOT NULL and sj.eu_id IS NOT NULL
+
+
+CREATE OR REPLACE VIEW public.vw_static_ships_jan
+AS SELECT t1.mmsi, t1.imo_num, t1.eu_id,t1.shp_name, t1.length, t1.beam, t1.draught, t1.ship_type, t1.destination,  t1.loaded, t1.haz_cargo,
+ t1."timestamp"
+   FROM ( SELECT DISTINCT sj.mmsi,
+            first_value(rtrim(sj.imo_num::character varying::text, ' @'::text)) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS imo_num,
+            sj.eu_id,
+            first_value(rtrim(sj.name, ' @'::text)) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS shp_name,
+            first_value(sj.length) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS length,
+            first_value(sj.beam) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS beam,
+            first_value(sj.draught) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS draught,
+            sj.ship_type,
+            sj.destination,
+            first_value(sj.loaded) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS loaded,
+            first_value(sj.haz_cargo) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS haz_cargo,
+            first_value(sj."timestamp") OVER (PARTITION BY sj.mmsi, sj.destination ORDER BY sj."timestamp") AS "timestamp"
+           FROM static_jan sj
+          WHERE sj.imo_num IS NOT NULL
+        UNION ALL
+         SELECT DISTINCT sj.mmsi,
+            first_value(rtrim(sj.imo_num::character varying::text, ' @'::text)) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS imo_num,
+            sj.eu_id,
+            first_value(rtrim(sj.name, ' @'::text)) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS shp_name,
+            first_value(sj.length) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS length,
+            first_value(sj.beam) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS beam,
+            first_value(sj.draught) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS draught,
+            sj.ship_type,
+            sj.destination,
+            first_value(sj.loaded) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS loaded,
+            first_value(sj.haz_cargo) OVER (PARTITION BY sj.mmsi ORDER BY sj."timestamp") AS haz_cargo,
+            first_value(sj."timestamp") OVER (PARTITION BY sj.mmsi, sj.destination ORDER BY sj."timestamp") AS "timestamp"
+           FROM static_jan sj
+          WHERE sj.eu_id IS NOT NULL) t1
+  ORDER BY t1.mmsi, t1."timestamp";
+
+
+--Step 2 create an intermidiate table to merge with dynamic_jan data
+
+create table dynamic_jan_merge as 
+select t1.order_num,sum(1) over (partition by dj.mmsi,dj."timestamp") order_max,dj.mmsi,dj.x,dj.y,dj.position_accuracy,dj.sog,dj.cog,dj.nav_status,dj."timestamp" t1,t1."timestamp" t2,t1.imo_num,t1.eu_id,t1.shp_name,t1.length,t1.beam,t1.draught,t1.ship_type,t1.destination,t1.loaded,t1.haz_cargo
+from 
+(SELECT distinct mmsi, x, y, position_accuracy, sog, cog, nav_status, "timestamp"
+FROM public.dynamic_jan) dj
+inner join (select 
+sum(1) OVER (partition by mmsi order by "timestamp") order_num,
+mmsi,
+first_value(rtrim(imo_num::varchar,' @')) over (partition by mmsi order by "timestamp" asc) imo_num,
+ case when eu_id is null then max(eu_id) over (partition by mmsi) else eu_id end eu_id,
+first_value(rtrim(shp_name,' @')) over (partition by mmsi order by "timestamp" asc nulls last) shp_name,
+first_value(length) over (partition by mmsi order by "timestamp" asc) length,
+first_value(beam) over (partition by mmsi order by "timestamp" asc) beam,
+first_value(draught) over (partition by mmsi order by "timestamp" asc) draught,
+max(ship_type) over (partition by mmsi order by "timestamp" asc)  ship_type,
+case when destination is null then first_value(destination) over (partition by mmsi order by "timestamp") else destination end  destination,
+case when loaded is null then max(loaded) over (partition by mmsi order by "timestamp" asc)  else loaded end loaded,
+case when haz_cargo is null then max(haz_cargo) over (partition by mmsi order by "timestamp" asc) else haz_cargo end haz_cargo,
+first_value("timestamp") over (partition by mmsi,destination order by "timestamp" asc nulls last) "timestamp"
+from vw_static_ships_jan order by mmsi,"timestamp") t1 on (dj.mmsi = t1.mmsi)
+order by mmsi,dj."timestamp",t1."timestamp"
+distributed randomly;
+
+--Step 3 Create a final result table
+
+create table final_jan as select mmsi, x, y, position_accuracy, sog, cog, nav_status, t1,  imo_num, eu_id, shp_name, length, beam, draught, ship_type, destination, loaded, haz_cargo
+from 
+(SELECT order_num,order_max, mmsi, x, y, position_accuracy, sog, cog, nav_status, t1,  imo_num, eu_id, shp_name, length, beam, draught, ship_type, destination, loaded, haz_cargo,order_num print
+FROM public.dynamic_jan_merge
+where order_num=1 and order_num=order_max
+union all
+SELECT order_num,order_max, mmsi, x, y, position_accuracy, sog, cog, nav_status, t1,  imo_num, eu_id, shp_name, length, beam, draught, ship_type, destination, loaded, haz_cargo,
+case 
+when t1>t2 and order_num = order_max then order_num
+when t1<t2 then first_value(order_num) over (partition by mmsi,t1 order by t2 asc)
+else null  end print
+FROM public.dynamic_jan_merge
+where order_max<>1) final_table
+where print=order_num 
+distributed randomly;
+
